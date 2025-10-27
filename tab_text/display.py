@@ -85,5 +85,4 @@ def display_tab_text_content(file_path: Optional[str] = None, df: Optional[pd.Da
         except Exception as e:
             st.error(f"Error displaying frequent values: {e}")
 
-#hiiii
     
