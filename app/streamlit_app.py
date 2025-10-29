@@ -6,9 +6,7 @@ import os
 from pathlib import Path
 
 # Set Python path
-current_dir = os.path.dirname(__file__)
-parent_dir = str(Path(current_dir).resolve().parents[0])
-sys.path.append(parent_dir)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom functions
 from tab_df.display import display_tab_df_content
