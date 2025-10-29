@@ -1,85 +1,97 @@
 # tab_num/display.py
 import streamlit as st
-import altair as alt
 import pandas as pd
-from .logics import get_numeric_columns, compute_numeric_summary, get_value_frequencies
+from typing import Optional
+
+from tab_num.logics import NumericColumn
 
 
-def display_numeric_tab(df: pd.DataFrame):
-    """Render numeric tab with summary stats, top values, and visual distribution."""
-    
-    st.header("📊 Numeric Column Analysis")
+def display_tab_num_content(file_path: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> None:
+    """
+    Instantiates tab_num.logics.NumericColumn, stores it in Streamlit session state,
+    finds numeric columns, lets the user pick one, and shows summary, histogram,
+    and most frequent values. Compatible with both attribute- and method-based APIs.
+    """
 
-    if df is None or df.empty:
-        st.warning("Upload a CSV file to start numeric analysis.")
+    # --- Load dataframe if only a file path is provided ---
+    if df is None:
+        if file_path:
+            try:
+                df = pd.read_csv(file_path)
+            except Exception as e:
+                st.error(f"Failed to read CSV from '{file_path}'. Error: {e}")
+                return
+        else:
+            st.info("Please upload or provide a dataframe to explore numeric columns.")
+            return
+
+    # --- Create or reuse NumericColumn object in session state (use kwargs!) ---
+    if "tab_num_obj" not in st.session_state:
+        st.session_state["tab_num_obj"] = NumericColumn(file_path=file_path, df=df)
+    else:
+        obj = st.session_state["tab_num_obj"]
+        obj.df = df
+        obj.file_path = file_path
+
+    num_obj: NumericColumn = st.session_state["tab_num_obj"]
+
+    # --- Find numeric columns ---
+    num_cols = num_obj.find_num_cols()
+    if not num_cols:
+        st.warning("No numeric columns detected in the dataset.")
         return
 
-    # --- Detect numeric columns ---
-    numeric_cols = get_numeric_columns(df)
-    if not numeric_cols:
-        st.info("No numeric columns detected in this dataset.")
-        return
-
-    # --- Column selection ---
-    selected_col = st.selectbox("Select a numeric column:", numeric_cols)
+    # --- Select column to explore ---
+    selected_col = st.selectbox(
+        "Which numeric column do you want to explore",
+        options=num_cols,
+        index=0,
+        key="tab_num_select_col",
+    )
     if not selected_col:
         return
 
-    # --- Session persistence (avoid recalculating on rerun) ---
-    key_obj = f"num_obj_{selected_col}"
-    if key_obj not in st.session_state:
-        st.session_state[key_obj] = {
-            "summary": compute_numeric_summary(df, selected_col),
-            "freq_df": get_value_frequencies(df, selected_col)
-        }
+    # --- Compute metrics for selected column ---
+    try:
+        num_obj.set_data(selected_col)
+    except Exception as e:
+        st.error(f"Could not compute numeric metrics for '{selected_col}'. Error: {e}")
+        return
 
-    summary = st.session_state[key_obj]["summary"]
-    freq_df = st.session_state[key_obj]["freq_df"]
+    # --- Display results inside an Expander ---
+    with st.expander("Numeric Column Analysis", expanded=True):
+        # Summary Table
+        try:
+            st.table(num_obj.get_summary())
+        except Exception as e:
+            st.error(f"Error generating summary: {e}")
 
-    # --- Summary Table ---
-    st.subheader("Summary Statistics")
-    summary_df = pd.DataFrame(list(summary.items()), columns=["Metric", "Value"])
-    summary_df["Value"] = summary_df["Value"].apply(
-        lambda x: f"{x:.2f}" if isinstance(x, float) else int(x)
-    )
-    st.table(summary_df)
+        # Histogram (supports method or attribute)
+        try:
+            chart = None
+            # prefer callable method if present
+            if hasattr(num_obj, "histogram") and callable(getattr(num_obj, "histogram")):
+                chart = num_obj.histogram()
+            else:
+                # else treat as attribute
+                chart = getattr(num_obj, "histogram", None)
 
-    # --- Top 20 most frequent values ---
-    st.subheader("Top 20 Most Frequent Values")
-    freq_df["Percentage (%)"] = freq_df["Percentage (%)"].round(2)
-    st.dataframe(freq_df, use_container_width=True)
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error rendering histogram: {e}")
 
-    # --- Distribution chart ---
-    st.subheader("Value Frequency Distribution")
-    unique_vals = df[selected_col].nunique()
+        # Most Frequent Values (supports method or attribute)
+        st.subheader("Most Frequent Values")
+        try:
+            if hasattr(num_obj, "frequent") and callable(getattr(num_obj, "frequent")):
+                freq_df = num_obj.frequent()
+            else:
+                freq_df = getattr(num_obj, "frequent", None)
 
-    if unique_vals <= 30:
-        # Low-cardinality → bar chart
-        chart = (
-            alt.Chart(freq_df)
-            .mark_bar(color="#1f77b4")
-            .encode(
-                x=alt.X("Value:O", sort="-y", title="Value"),
-                y=alt.Y("Count:Q", title="Frequency"),
-                tooltip=["Value", "Count", "Percentage (%)"]
-            )
-            .properties(title=f"Value Distribution – {selected_col}", height=400)
-            .interactive()
-        )
-    else:
-        # High-cardinality → histogram
-        hist_series = pd.to_numeric(df[selected_col], errors="coerce").dropna()
-        hist_df = pd.DataFrame({selected_col: hist_series})
-        chart = (
-            alt.Chart(hist_df)
-            .mark_bar(color="#ff7f0e")
-            .encode(
-                x=alt.X(f"{selected_col}:Q", bin=alt.Bin(maxbins=30), title="Value Range"),
-                y=alt.Y("count()", title="Frequency")
-            )
-            .properties(title=f"Histogram – {selected_col}", height=400)
-            .interactive()
-        )
-        st.caption("High unique values detected → histogram with 30 bins.")
+            if freq_df is not None:
+                st.write(freq_df)
+        except Exception as e:
+            st.error(f"Error displaying frequent values: {e}")
 
-    st.altair_chart(chart, use_container_width=True)
+    
