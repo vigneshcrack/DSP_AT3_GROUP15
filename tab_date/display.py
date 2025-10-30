@@ -1,95 +1,71 @@
-from typing import Optional 
 import streamlit as st
 import pandas as pd
-
 from tab_date.logics import DateColumn
 
-# Explicit export to avoid name/visibility issues
-__all__ = ["display_tab_date_content"]
 
-
-def display_tab_date_content(
-    file_path: Optional[str] = None,
-    df: Optional[pd.DataFrame] = None,
-) -> None:
+def display_tab_date_content(file_path=None, df=None):
     """
-    Create/refresh a DateColumn object, find datetime columns, let the user
-    pick one, then show summary, chart and frequent values.
+    UI for the Datetime Serie tab.
+
+    Behaviour:
+      - Lists native datetime columns; if none, only highly date-parsable text columns.
+      - If still none, shows an info message.
+      - After selection, always attempts to parse and then displays either:
+          * summary + chart + frequent table, or
+          * a helpful message when the column can't be parsed.
     """
-
-    # ---- Load DataFrame if only a file path is given ----
-    if df is None:
-        if file_path:
-            try:
-                df = pd.read_csv(file_path)
-            except Exception as e:
-                st.error(f"Failed to read CSV from '{file_path}'. Error: {e}")
-                return
-        else:
-            st.info("Please upload or provide a dataframe to explore datetime columns.")
-            return
-
-    # ---- Create/reuse DateColumn in session state (use keyword args!) ----
-    if "tab_date_obj" not in st.session_state:
-        st.session_state["tab_date_obj"] = DateColumn(file_path=file_path, df=df)
+    # Keep a single DateColumn instance in session state
+    if "date_tab" not in st.session_state:
+        st.session_state.date_tab = DateColumn(file_path=file_path, df=df)
     else:
-        obj: DateColumn = st.session_state["tab_date_obj"]
-        obj.df = df
-        obj.file_path = file_path
+        if df is not None:
+            st.session_state.date_tab.df = df
+        if file_path is not None:
+            st.session_state.date_tab.file_path = file_path
 
-    date_obj: DateColumn = st.session_state["tab_date_obj"]
+    datec: DateColumn = st.session_state.date_tab
 
-    # ---- Find datetime-like columns (support both method names) ----
-    date_cols = None
-    if hasattr(date_obj, "find_date_cols"):
-        out = date_obj.find_date_cols()
-        date_cols = out if isinstance(out, list) else getattr(date_obj, "cols_list", [])
-    elif hasattr(date_obj, "datetime_columns"):
-        date_cols = date_obj.datetime_columns()
-    else:
-        date_cols = []
+    # Discover available datetime/date-like columns
+    datec.find_date_cols()
 
-    if not date_cols:
-        st.warning("No datetime-like columns found in this dataset.")
+    st.subheader("Datetime Serie")
+
+    # Nothing to show? Exit gracefully.
+    if not datec.cols_list:
+        st.info("No datetime or date-like columns found in this dataset.")
         return
 
-    # ---- Select column to explore ----
+    # Select a column to explore
     selected_col = st.selectbox(
         "Which datetime column do you want to explore",
-        options=date_cols,
-        index=0,
-        key="tab_date_select_col",
+        datec.cols_list,
     )
     if not selected_col:
         return
 
-    # ---- Compute/Render ----
-    try:
-        date_obj.set_data(selected_col)
-    except Exception as e:
-        st.error(f"Could not compute datetime metrics for '{selected_col}'. Error: {e}")
+    # Compute stats & visuals (handles both true datetime and text columns)
+    datec.set_data(selected_col)
+
+    # If parsing failed (all NaT), show a helpful message and a quick peek
+    if datec.serie is None or datec.serie.dropna().empty:
+        st.warning(
+            f"Could not parse any dates from `{selected_col}`. "
+            "Here are a few raw values from the original column to investigate formats."
+        )
+        try:
+            raw = st.session_state.date_tab.df[selected_col].dropna().astype(str).head(20)
+            st.dataframe(pd.DataFrame({"sample_values": raw}), use_container_width=True)
+        except Exception:
+            pass
         return
 
+    # Summary table
     with st.expander("Date Column", expanded=True):
-        # Summary
-        try:
-            st.table(date_obj.get_summary())
-        except Exception as e:
-            st.error(f"Error while generating summary: {e}")
+        st.table(datec.get_summary())
 
-        # Chart: prefer .histogram() if present; else .barchart attr
-        try:
-            chart = date_obj.histogram() if hasattr(date_obj, "histogram") and callable(date_obj.histogram) else getattr(date_obj, "barchart", None)
-            if chart is not None:
-                st.altair_chart(chart, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error while generating histogram: {e}")
+    # Histogram / bar chart
+    st.altair_chart(datec.barchart, use_container_width=True)
 
-        # Frequent values (method or DataFrame attr)
-        st.subheader("Most Frequent Values")
-        try:
-            freq_df = date_obj.frequent() if hasattr(date_obj, "frequent") and callable(date_obj.frequent) else getattr(date_obj, "frequent", None)
-            if freq_df is not None:
-                st.write(freq_df)
-        except Exception as e:
-            st.error(f"Error while listing frequent values: {e}")
+    # Top-20 frequency table
+    st.subheader("Most Frequent Values")
+    st.dataframe(datec.frequent, use_container_width=True)
