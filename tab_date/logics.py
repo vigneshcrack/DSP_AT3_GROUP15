@@ -1,115 +1,113 @@
-from __future__ import annotations
-
-import os
-from datetime import datetime
-from typing import List
-
-import altair as alt
-import numpy as np
 import pandas as pd
-from pandas.api.types import is_datetime64_any_dtype
+import altair as alt
+
+# A text column is considered "date-like" if >= 80% of its non-null values parse as dates
+DATE_PARSE_THRESHOLD = 0.8
+
+
+def _is_probably_datetime(s: pd.Series, threshold: float = DATE_PARSE_THRESHOLD) -> bool:
+    """Heuristic: treat a text column as 'date-like' if enough values parse as dates."""
+    if s is None:
+        return False
+    s = s.dropna().astype(str)
+    if s.empty:
+        return False
+    parsed = pd.to_datetime(s, errors="coerce", utc=False)
+    return float(parsed.notna().mean()) >= float(threshold)
 
 
 class DateColumn:
     """
-    Manages a dataframe datetime column for the Streamlit EDA app.
+    Class that manages a column from a dataframe of datetime data type.
+    Computes:
+      - unique, missing, min/max
+      - weekend/weekday counts
+      - future-date count
+      - occurrences of 1900-01-01 and 1970-01-01
+      - bar chart + top-20 frequent values
     """
-
-    def __init__(self, file_path: Optional[str] = None, df: Optional[pd.DataFrame] = None):
+    def __init__(self, file_path=None, df=None):
         self.file_path = file_path
-        self.df: Optional[pd.DataFrame] = df
-        self.cols_list: List[str] = []
+        self.df = df
+        self.cols_list = []
+        self.serie = None
 
-        self.serie: Optional[pd.Series] = None
+        self.n_unique = None
+        self.n_missing = None
+        self.col_min = None
+        self.col_max = None
+        self.n_weekend = None
+        self.n_weekday = None
+        self.n_future = None
+        self.n_empty_1900 = None
+        self.n_empty_1970 = None
 
-        # computed stats
-        self.n_unique: Optional[int] = None
-        self.n_missing: Optional[int] = None
-        self.col_min: Optional[pd.Timestamp] = None
-        self.col_max: Optional[pd.Timestamp] = None
-        self.n_weekend: Optional[int] = None
-        self.n_weekday: Optional[int] = None
-        self.n_future: Optional[int] = None
-        self.n_empty_1900: Optional[int] = None
-        self.n_empty_1970: Optional[int] = None
-
-        # visuals/tables
         self.barchart = alt.Chart()
         self.frequent = pd.DataFrame(columns=["value", "occurrence", "percentage"])
 
-    # ------------------------------------------------------------------
-    def find_date_cols(self) -> List[str]:
-        """
-        Load the CSV if needed and find datetime-like columns.
+    # ---------- helpers ----------
+    def _ensure_df(self):
+        if self.df is None and self.file_path:
+            self.df = pd.read_csv(self.file_path)
 
-        Strategy:
-        1) Include columns already typed as datetime64.
-        2) Infer date columns from object/string by parsing a sample:
-           accept a column if >=60% of a 500-value sample parses to a date
-           and there are at least ~5 unique parsed values.
+    # ---------- discovery ----------
+    def find_date_cols(self):
         """
-        # Load df if not provided
+        Prefer native datetime columns; if none exist, include only text columns
+        that are highly parsable as dates. If still none, return an empty list.
+        """
+        self._ensure_df()
         if self.df is None:
-            if isinstance(self.file_path, (str, os.PathLike)) and str(self.file_path).strip():
-                self.df = pd.read_csv(self.file_path)
-            else:
-                self.cols_list = []
-                return []
-
-        if self.df is None or getattr(self.df, "empty", True):
             self.cols_list = []
-            return []
+            return
 
-        df = self.df
+        # 1) native datetime (includes tz-aware)
+        dt_cols = [c for c in self.df.columns if pd.api.types.is_datetime64_any_dtype(self.df[c])]
+        if dt_cols:
+            self.cols_list = dt_cols
+            return
 
-        # 1) already-typed datetime columns
-        dt_cols = [c for c in df.columns if is_datetime64_any_dtype(df[c])]
+        # 2) text columns that *look* like dates
+        text_like = self.df.select_dtypes(include=["object", "string"]).columns.tolist()
+        dateish = [c for c in text_like if _is_probably_datetime(self.df[c])]
 
-        # 2) try to infer from object/string columns
-        candidate_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+        # 3) do NOT fall back to all text; leave empty if none are date-like
+        self.cols_list = dateish
 
-        def looks_like_datetime(series: pd.Series, min_fraction: float = 0.6) -> bool:
-            sample = series.dropna().astype(str).head(500)
-            if sample.empty:
-                return False
-            parsed = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True, utc=False)
-            frac = parsed.notna().mean()
-            # require some variety to avoid flagging constant literals
-            return (frac >= min_fraction) and (parsed.nunique(dropna=True) >= 5)
-
-        inferred = []
-        for c in candidate_cols:
-            try:
-                if looks_like_datetime(df[c]):
-                    inferred.append(c)
-            except Exception:
-                continue  # be conservative
-
-        # Merge, dedupe, preserve order
-        seen = set()
-        ordered = []
-        for c in dt_cols + inferred:
-            if c not in seen:
-                ordered.append(c)
-                seen.add(c)
-
-        self.cols_list = ordered
-        return ordered
-
-    # ------------------------------------------------------------------
-    def set_data(self, col_name: str) -> None:
+    # ---------- compute ----------
+    def set_data(self, col_name):
         """
-        Select the column, convert to datetime, compute all statistics,
-        the histogram chart and the frequent table.
+        Selects the column, ensures conversion to datetime, and computes stats.
+        Safe for both true datetime and text columns.
         """
-        if self.df is None:
-            raise ValueError("DataFrame is not set in DateColumn.")
-        if col_name not in self.df.columns:
-            raise KeyError(f"Column '{col_name}' does not exist in the dataframe.")
+        self._ensure_df()
+        if self.df is None or col_name not in self.df.columns:
+            self.serie = None
+            return
 
+        # Fresh copy of the selected column
         self.serie = self.df[col_name].copy()
-        self.convert_serie_to_date()
 
+        # Force conversion to datetime (unparseable -> NaT)
+        if not pd.api.types.is_datetime64_any_dtype(self.serie):
+            self.serie = pd.to_datetime(self.serie, errors="coerce")
+
+        # If everything is NaT after parsing, populate zeros and exit gracefully
+        if self.serie.dropna().empty:
+            self.n_unique = 0
+            self.n_missing = int(self.serie.isna().sum())
+            self.col_min = None
+            self.col_max = None
+            self.n_weekend = 0
+            self.n_weekday = 0
+            self.n_future = 0
+            self.n_empty_1900 = 0
+            self.n_empty_1970 = 0
+            self.barchart = alt.Chart()
+            self.frequent = pd.DataFrame(columns=["value", "occurrence", "percentage"])
+            return
+
+        # Compute all stats
         self.set_unique()
         self.set_missing()
         self.set_min()
@@ -122,147 +120,105 @@ class DateColumn:
         self.set_barchart()
         self.set_frequent()
 
-    # ------------------------------------------------------------------
-    def convert_serie_to_date(self) -> None:
-        """Ensure self.serie is datetime (coerce errors to NaT)."""
-        if self.serie is None:
-            return
-        if not is_datetime64_any_dtype(self.serie):
-            self.serie = pd.to_datetime(self.serie, errors="coerce", infer_datetime_format=True, utc=False)
+    def is_serie_none(self):
+        return self.serie is None or len(self.serie) == 0
 
-    # Convenience so display can always call .histogram()
-    def histogram(self):
-        return getattr(self, "barchart", None)
+    # ---------- metrics ----------
+    def set_unique(self):
+        self.n_unique = 0 if self.is_serie_none() else self.serie.nunique(dropna=True)
 
-    # ------------------------------------------------------------------
-    def is_serie_none(self) -> bool:
-        return (self.serie is None) or (len(self.serie) == 0)
+    def set_missing(self):
+        self.n_missing = 0 if self.is_serie_none() else int(self.serie.isna().sum())
 
-    # ------------------------------------------------------------------
-    def set_unique(self) -> None:
-        if self.is_serie_none():
-            self.n_unique = 0
-            return
-        self.n_unique = int(self.serie.nunique(dropna=True))
-
-    # ------------------------------------------------------------------
-    def set_missing(self) -> None:
-        if self.is_serie_none():
-            self.n_missing = 0
-            return
-        self.n_missing = int(self.serie.isna().sum())
-
-    # ------------------------------------------------------------------
-    def set_min(self) -> None:
-        if self.is_serie_none():
+    def set_min(self):
+        if self.is_serie_none() or self.serie.dropna().empty:
             self.col_min = None
-            return
-        self.col_min = self.serie.min(skipna=True)
+        else:
+            self.col_min = self.serie.min()
 
-    # ------------------------------------------------------------------
-    def set_max(self) -> None:
-        if self.is_serie_none():
+    def set_max(self):
+        if self.is_serie_none() or self.serie.dropna().empty:
             self.col_max = None
-            return
-        self.col_max = self.serie.max(skipna=True)
+        else:
+            self.col_max = self.serie.max()
 
-    # ------------------------------------------------------------------
-    def set_weekend(self) -> None:
+    def set_weekend(self):
         if self.is_serie_none():
             self.n_weekend = 0
             return
         s = self.serie.dropna()
         self.n_weekend = int((s.dt.dayofweek >= 5).sum())
 
-    # ------------------------------------------------------------------
-    def set_weekday(self) -> None:
+    def set_weekday(self):
         if self.is_serie_none():
             self.n_weekday = 0
             return
         s = self.serie.dropna()
         self.n_weekday = int((s.dt.dayofweek < 5).sum())
 
-    # ------------------------------------------------------------------
-    def set_future(self) -> None:
+    def set_future(self):
         if self.is_serie_none():
             self.n_future = 0
             return
         s = self.serie.dropna()
-        today = pd.Timestamp(datetime.now().date())
+        today = pd.Timestamp.today().normalize()
         self.n_future = int((s > today).sum())
 
-    # ------------------------------------------------------------------
-    def set_empty_1900(self) -> None:
+    def set_empty_1900(self):
         if self.is_serie_none():
             self.n_empty_1900 = 0
             return
         s = self.serie.dropna()
-        target = pd.Timestamp("1900-01-01")
-        self.n_empty_1900 = int((s == target).sum())
+        self.n_empty_1900 = int((s.dt.normalize() == pd.Timestamp("1900-01-01")).sum())
 
-    # ------------------------------------------------------------------
-    def set_empty_1970(self) -> None:
+    def set_empty_1970(self):
         if self.is_serie_none():
             self.n_empty_1970 = 0
             return
         s = self.serie.dropna()
-        target = pd.Timestamp("1970-01-01")
-        self.n_empty_1970 = int((s == target).sum())
+        self.n_empty_1970 = int((s.dt.normalize() == pd.Timestamp("1970-01-01")).sum())
 
-    # ------------------------------------------------------------------
-    def set_barchart(self) -> None:
-        """
-        Build an Altair bar chart showing counts per date (no binning),
-        which matches the assignment screenshots.
-        """
+    def set_barchart(self):
         if self.is_serie_none():
             self.barchart = alt.Chart()
             return
-
-        s = self.serie.dropna()
-        if s.empty:
-            self.barchart = alt.Chart()
-            return
-
-        df_plot = pd.DataFrame({"date": s})
+        counts = (
+            self.serie.dropna()
+            .dt.normalize()
+            .value_counts()
+            .rename_axis("value")
+            .reset_index(name="count")
+            .sort_values("value")
+        )
         self.barchart = (
-            alt.Chart(df_plot)
+            alt.Chart(counts)
             .mark_bar()
-            .encode(
-                x=alt.X("date:T", title="date"),
-                y=alt.Y("count():Q", title="Count of Records"),
-            )
-            .properties(title="Bar Chart", height=300)
+            .encode(x=alt.X("value:T", title=None), y=alt.Y("count:Q"))
+            .properties(title="Bar Chart")
         )
 
-    # ------------------------------------------------------------------
-    def set_frequent(self, end: int = 20) -> None:
-        """
-        Compute most frequent datetime values (with percentage).
-        """
+    def set_frequent(self, end=20):
         if self.is_serie_none():
             self.frequent = pd.DataFrame(columns=["value", "occurrence", "percentage"])
             return
+        counts = (
+            self.serie.dropna()
+            .dt.normalize()
+            .value_counts()
+            .rename_axis("value")
+            .reset_index(name="occurrence")
+        )
+        counts["percentage"] = counts["occurrence"] / counts["occurrence"].sum()
+        self.frequent = counts.head(end)
 
-        vc = self.serie.value_counts(dropna=False).head(end)
-        total = int(len(self.serie))
-        df_top = vc.rename_axis("value").reset_index(name="occurrence")
-        df_top["percentage"] = (df_top["occurrence"] / total).astype(float)
-        self.frequent = df_top
-
-    # ------------------------------------------------------------------
-    def get_summary(self) -> pd.DataFrame:
-        """
-        Return a two-column dataframe (Description, Value) with all metrics.
-        Order matches the assignment rubric/screenshots.
-        """
+    def get_summary(self):
         rows = [
             ("Number of Unique Values", self.n_unique),
             ("Number of Rows with Missing Values", self.n_missing),
             ("Number of Weekend Dates", self.n_weekend),
             ("Number of Weekday Dates", self.n_weekday),
             ("Number of Dates in Future", self.n_future),
-            ("Number of Rows with 1900-01-01", self.n_empty_1900 if self.n_empty_1900 != 0 else None),
+            ("Number of Rows with 1900-01-01", self.n_empty_1900),
             ("Number of Rows with 1970-01-01", self.n_empty_1970),
             ("Minimum Value", self.col_min),
             ("Maximum Value", self.col_max),
